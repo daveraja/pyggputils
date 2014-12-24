@@ -80,12 +80,12 @@ class Handler(object):
     SEARCH_INFO = r'\s*\(\s*INFO'
     SEARCH_ABORT = r'\s*\(\s*ABORT'
     SEARCH_PREVIEW = r'\s*\(\s*PREVIEW'
-    MATCH_START = r'^\s*\(\s*START\s+([^\s]+)\s+(\w+)\s+\((.*)\)\s+(\d+)\s+(\d+)\s*\)\s*$'
+    MATCH_START = r'^\s*\(\s*START\s+([^\s]+)\s+([^\s]+)\s+\((.*)\)\s+(\d+)\s+(\d+)\s*\)\s*$'
     MATCH_PLAY = r'^\s*\(\s*PLAY\s+([^\s]+)\s+(.*)\s*\)\s*$'
     MATCH_STOP = r'^\s*\(\s*STOP\s+([^\s]+)\s+(.*)\s*\)\s*$'
     MATCH_INFO = r'\s*\(\s*INFO\s*\)\s*$'
     MATCH_ABORT = r'\s*\(\s*ABORT\s+([^\s]+)\s*\)\s*$'
-    MATCH_PREVIEW = r'\s*\(\s*PREVIEW\s+(.*)\s+(\d+)\s*\)\s*$'
+    MATCH_PREVIEW = r'\s*\(\s*PREVIEW\s+\((.*)\)\s+(\d+)\s*\)\s*$'
     MATCH_SPS_MATCHID = r'\s*\(\s*(START|PLAY|STOP)\s+([^\s]+)\s+.*\)\s*$'
 
     re_s_START = re.compile(SEARCH_START, re.IGNORECASE)
@@ -110,12 +110,19 @@ class Handler(object):
     # - PREVIEW: does nothing except responds with "DONE"
     # - INFO: if not in a game then responds with "AVAILABLE", or "BUSY" otherwise.
     #---------------------------------------------------------------------------------
-    def __init__(self, on_start, on_play, on_stop, on_abort, on_info=None, on_preview=None):
+    def __init__(self, on_start, on_play, on_stop, on_abort,
+                 on_info=None, on_preview=None, test_mode=False):
+
+        # Test mode is useful for unit testing individual callback functions
+        if not test_mode:
+            if not (on_start and on_play and on_stop and on_abort):
+                raise ValueError(("Must have valid callbacks for: on_start, "
+                                  "on_play, on_stop, on_abort"))
         self._on_START = on_start
         self._on_PLAY = on_play
         self._on_STOP = on_stop
-        self._on_INFO = on_info
         self._on_ABORT = on_abort
+        self._on_INFO = on_info
         self._on_PREVIEW = on_preview
 
         self._all_conn_queue = Queue()
@@ -132,11 +139,12 @@ class Handler(object):
     #----------------------------------------------------------------------------
     # Call that adheres to the WSGI application specification. Handles
     # all connections in order and tries to weed out bad
-    # ones. Maintains two queues: all connections and good
-    # connections. Every connection is added to the all connections
-    # queue. It then decides if it is a bad connection in which case
-    # it doesn't go on the good connection queue. If it is a good
-    # connection then it is placed on the good connection queue to to
+    # ones. Maintains two queues: all-connections and
+    # good-connections. Every connection is added to the
+    # all-connections queue. It then decides if it is a bad connection
+    # in which case it doesn't go on to the good-connection queue. This
+    # is done immediately on the handler being called. If it is a good
+    # connection then it is placed on the good-connection queue to
     # ensure that only one message is handled at a time and that it is
     # handled in the correct order.
     #
@@ -144,8 +152,8 @@ class Handler(object):
     # filtered out while maintaining a clean orderly queue for
     # legitimate messages. Of course, in normal operation we would
     # expect the good queue to only ever contain the current message
-    # being handled, but it does mean that even if the player does get
-    # behind the messages will be processed in an orderly way and
+    # being handled, but it does mean that even if the player gets
+    # behind, the messages will be processed in an orderly way and
     # there is the possibility of catching up.
     # ----------------------------------------------------------------------------
     def __call__(self, environ, start_response):
@@ -196,7 +204,7 @@ class Handler(object):
     #---------------------------------------------------------------------------------
     # Internal functions to handle messages
     # _app_normal is for normal operation.
-    # _app_bad is called when the handle for bad connections.
+    # _app_bad is called when the handle is for bad a connection.
     #---------------------------------------------------------------------------------
     def _app_normal(self, environ, start_response, timestamp, post_message):
         try:
@@ -221,13 +229,10 @@ class Handler(object):
 
     def _app_bad(self, environ, start_response):
         try:
-            # Simply return BUSY
-            if self._uppercase: response_body = "BUSY"
-            response_body = "busy"
-
-            response_headers = _get_response_headers(environ, response_body)
-            start_response('200 OK', response_headers)
-            return response_body
+            # Return an error
+            response_headers = _get_response_headers(environ, "")
+            start_response('400 Invalid GGP message', response_headers)
+            return ""
 
         except Exception as e:
             g_logger.error(_fmt("Unknown Exception: {0}", e))
@@ -241,6 +246,10 @@ class Handler(object):
     # - ABORT should always be let through.
     # - If a START/PLAY/STOP message has not been responded to within its timeout.
     #   then we let the message through. Otherwise its not our fault so assume bad.
+    #
+    # BUG NOTE 20141224: I need to revisit this at some point. Firstly, should weed out
+    # non-GGP messages here. Also should probably allow mismatched matchids here but
+    # ensure that it checks later to make sure there are no problems.
     #---------------------------------------------------------------------------------
     def _is_good_connection(self, environ, timestamp, message):
 
@@ -249,23 +258,20 @@ class Handler(object):
 
         # A START message when we're already in a game is bad
 #        if Handler.re_s_START.match(message):
-#            if not self._matchid is None: return False
-#            else: return True
 
-# NOTE: 20140603 - Changing behaviour of on receiving a START message
-# during a running game. I have been assuming that the game controller
-# is working properly so should NEVER to dodgy things like crashing
-# part way through a game (or if it does then it is ok that the qp
-# controller needs to be restarted). However, for debugging purposes,
-# Abdallah has been simply stopping the game controller part way
-# through a game. I'm not sure I want the qp controller to be tolerant
-# to this because it might open us up to problems down the track. But
-# in any case for the moment I'm changing this to let it work.
-
-        if Handler.re_s_START.match(message): return True
-
-
-
+        # A START message when we are in a game could mean a number of things:
+        # 1) either a message has been lost (somehow) or
+        # 2) The game master is not operating correctly (eg. crashed and restarted)
+        # 3) The player (i.e., the callback functions) has not been responded
+        #    within the timeout and there may be an end/abort message that is in
+        #    the queue waiting to be handled.
+        # Whatever the case the best we can do is log an error and let the
+        # message through.
+        if Handler.re_s_START.match(message):
+            if self._matchid is not None:
+                g_logger.error(("A new START message has been received before the"
+                                "match {0} has ended.").format(self._matchid))
+            return True
 
         # Non-START game messages (those with matchids) are ok only if
         # they match the current matchid.
@@ -281,17 +287,14 @@ class Handler(object):
             if matchid == self._matchid: return True
             else: return False
 
-            # If the good connection queue is empty then pass it on
-#            if self._good_conn_queue.empty(): return True
-
-            # I guess everything else is ok
+        # It is good
         return True
 
     #---------------------------------------------------------------------------------
-    # Internal functions to format the response message based on the game master
-    # using upper or lower case. Don't think it matters for Dresden game master but
-    # does Stanford.
-    #---------------------------------------------------------------------------------
+    # Internal functions to format the response message based on the
+    # game master using upper or lower case. Don't think it matters
+    # for the Dresden game master but does for Stanford.
+    # ---------------------------------------------------------------------------------
     def _response(self, response):
         if self._uppercase: return response.upper()
         return response.lower()
@@ -405,7 +408,7 @@ class Handler(object):
         actionstr = match.group(2)
         actions = parse_actions_sexp(actionstr)
         if len(actions) != len(self._roles):
-            raise HTTPErrorResponse(400, "Malformed PLAY message {0}".format(message))
+            raise HTTPErrorResponse(400, "Malformed STOP message {0}".format(message))
 
         timeout = Timeout(timestamp, self._playclock)
         self._on_STOP(timeout.clone(), dict(zip(self._roles, actions)))
@@ -431,9 +434,13 @@ class Handler(object):
             return self._response("AVAILABLE")
 
         # Use the user-provided callback
+        response = self._on_INFO()
+        if not response:
+            raise ValueError("on_info() callback returned an empty value")
         return self._response(self._on_INFO())
 
     def handle_ABORT(self, timestamp, message):
+        self._set_case(message, "ABORT")
         match = Handler.re_m_ABORT.match(message)
         if not match:
             raise HTTPErrorResponse(400, "Malformed ABORT message {0}".format(message))
@@ -526,7 +533,8 @@ def _get_response_headers(environ, response_body):
         # Now the other headers
         newenv.append(('Content-Length', str(len(response_body))))
         newenv.append(('Access-Control-Allow-Origin', '*'))
-        newenv.append(('Access-Control-Allow-Method', 'POST, GET, OPTIONS'))
+#        newenv.append(('Access-Control-Allow-Method', 'POST, GET, OPTIONS'))
+        newenv.append(('Access-Control-Allow-Method', 'POST'))
         newenv.append(('Allow-Control-Allow-Headers', 'Content-Type'))
         newenv.append(('Access-Control-Allow-Age', str(86400)))
     except:
@@ -536,7 +544,9 @@ def _get_response_headers(environ, response_body):
 
 #---------------------------------------------------------------------------------
 # _get_http_post(environ)
-# Checks that it is a valid http post message and returns the context of the message.
+# Checks that it is a valid http post message and returns the content of the message.
+# NOTE: should be call only once because the 'wsgi.input' object is a stream object
+#       so will be empty once it has been read.
 #---------------------------------------------------------------------------------
 def _get_http_post(environ):
     try:
