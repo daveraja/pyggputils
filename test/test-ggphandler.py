@@ -17,7 +17,7 @@ g_logger = logging.getLogger()
 class Player(object):
     def __init__(self):
         pass
-    
+
     def on_start(self, timeout, matchid, role, gdl, playclock):
         pass
 
@@ -25,6 +25,12 @@ class Player(object):
         pass
 
     def on_stop(self, timeout, actions):
+        pass
+
+    def on_play2(self, timeout, observations):
+        pass
+
+    def on_stop2(self, timeout, observations):
         pass
 
     def on_abort(self):
@@ -35,28 +41,35 @@ class Player(object):
 
     def on_preview(self, timeout, gdl):
         pass
-    
+
 
 #---------------------------------------------------------------------------------
 # Useful helper functions
 #---------------------------------------------------------------------------------
-def make_handler(on_start=None, on_play=None, on_stop=None,
-                 on_abort=None, on_info=None, on_preview=None):
-    return Handler(on_start=on_start, on_play=on_play, on_stop=on_stop,
+def make_handler(on_start=None,
+                 on_play=None, on_stop=None,
+                 on_play2=None, on_stop2=None,
+                 on_abort=None, on_info=None,on_preview=None,
+                 protocol_version=Handler.GGP1):
+    return Handler(on_start=on_start,
+                   on_play=on_play, on_stop=on_stop,
+                   on_play2=on_play2, on_stop2=on_stop2,
                    on_abort=on_abort, on_info=on_info,
-                   on_preview=on_preview, test_mode=True)
-    
+                   on_preview=on_preview,
+                   protocol_version=protocol_version,
+                   test_mode=True)
+
 def make_environ(data):
     environ = { 'REQUEST_METHOD': 'POST',
                 'wsgi.input': StringIO.StringIO(data),
-                'CONTENT_LENGTH' : str(len(data)) }    
+                'CONTENT_LENGTH' : str(len(data)) }
     setup_testing_defaults(environ)
     return environ
 
 #---------------------------------------------------------------------------------
 # Unit test class
 #---------------------------------------------------------------------------------
-class GGPHandlerTest(unittest.TestCase):       
+class GGPHandlerTest(unittest.TestCase):
 
     #------------------------------------------
     # Useful start_response callbacks
@@ -92,7 +105,7 @@ class GGPHandlerTest(unittest.TestCase):
             self.assertEqual(role, "robot")
             self.assertEqual(gdl, "(role robot) (other gdl)")
             self.assertEqual(playclock, int(5))
-        
+
         handler = make_handler(on_start=on_start)
 
         # A bad start message
@@ -120,7 +133,7 @@ class GGPHandlerTest(unittest.TestCase):
             def on_abort(self):
                 self._called = True
 
-        # A dummy start message callback 
+        # A dummy start message callback
         def on_start(timeout, matchid, role, gdl, playclock):
             pass
 
@@ -140,7 +153,7 @@ class GGPHandlerTest(unittest.TestCase):
         environ = make_environ("(ABORT testmatch1)")
         body = handler(environ, self.start_response_status_ok)
         self.assertTrue(tmp._called)
-                
+
     #------------------------------------------
     # Test GGP PLAY message
     #------------------------------------------
@@ -160,7 +173,7 @@ class GGPHandlerTest(unittest.TestCase):
                 self._actions = actions
                 self._called = True
 
-        # A dummy start message callback 
+        # A dummy start message callback
         def on_start(timeout, matchid, role, gdl, playclock):
             pass
 
@@ -181,7 +194,7 @@ class GGPHandlerTest(unittest.TestCase):
         environ = make_environ("(PLAY testmatch1 ((a move )))")
         body = handler(environ, self.start_response_status_ok)
         self.assertTrue(tmp._called)
- 
+
     #------------------------------------------
     # Test GGP STOP message
     #------------------------------------------
@@ -201,7 +214,7 @@ class GGPHandlerTest(unittest.TestCase):
                 self._actions = actions
                 self._called = True
 
-        # A dummy start message callback 
+        # A dummy start message callback
         def on_start(timeout, matchid, role, gdl, playclock):
             pass
 
@@ -221,7 +234,114 @@ class GGPHandlerTest(unittest.TestCase):
         environ = make_environ("(STOP testmatch1 ((a move )))")
         body = handler(environ, self.start_response_status_ok)
         self.assertTrue(tmp._called)
-                   
+
+
+    #------------------------------------------
+    # Test GGP PLAY GDL-II message
+    #------------------------------------------
+    def test_play2_message(self):
+
+        # Note python 2.X doesn't do well with nested functions and
+        # variable scoping, so use a class instead.
+        class TMP(object):
+            def __init__(self):
+                self._called = False
+                self._timeout = None
+                self._action = None
+                self._observations = []
+
+            # An abort message callback
+            def on_play2(self, timeout, action, observations):
+                self._timeout = timeout
+                self._action = action
+                self._observations = observations
+                self._called = True
+
+        # A dummy start message callback
+        def on_start(timeout, matchid, role, gdl, playclock):
+            pass
+
+        tmp = TMP()
+        handler = make_handler(on_start=on_start, on_play2=tmp.on_play2,
+                               protocol_version=Handler.GGP2)
+
+        # Test after a START message
+        environ = make_environ("(START testmatch1 robot ((role robot) (role random) (other gdl)) 10 5)")
+        body = handler(environ, self.start_response_status_ok)
+
+        # Test the NIL message
+        environ = make_environ("(PLAY testmatch1 0 NIL NIL)")
+        body = handler(environ, self.start_response_status_ok)
+        self.assertTrue(tmp._called)
+        self.assertEqual(tmp._action, None)
+        self.assertEqual(tmp._observations, [])
+
+        # Test a PLAY message
+        tmp._called = False
+        environ = make_environ("(PLAY testmatch1 1 (a move) ((one) (two) (three)))")
+        body = handler(environ, self.start_response_status_ok)
+        self.assertTrue(tmp._called)
+        self.assertEqual(tmp._action, "(a move)")
+        self.assertEqual(tmp._observations, ["(one)", "(two)", "(three)"])
+
+        # Test a PLAY message
+        tmp._called = False
+        environ = make_environ("(PLAY testmatch1 2 (another move) NIL)")
+        body = handler(environ, self.start_response_status_ok)
+        self.assertTrue(tmp._called)
+        self.assertEqual(tmp._action, "(another move)")
+        self.assertEqual(tmp._observations, [])
+
+        # This should fail because we require a list or "NIL" for observations
+        tmp._called = False
+        environ = make_environ("(PLAY testmatch1 2 (another move))")
+        body = handler(environ, self.start_response_status_not_ok)
+        self.assertFalse(body)
+
+    #------------------------------------------
+    # Test GGP STOP2 message
+    # FIXUP: for completeness should add gdl2 stop message testing but
+    # its almost identical to the play message so won't bother for the
+    # moment.
+    #------------------------------------------
+    def _test_stop2_message(self):
+
+        # Note python 2.X doesn't do well with nested functions and
+        # variable scoping, so use a class instead.
+        class TMP(object):
+            def __init__(self):
+                self._called = False
+                self._timeout = None
+                self._action = None
+                self._observations = []
+
+            # An abort message callback
+            def on_stop(self, timeout, action, observations):
+                self._timeout = timeout
+                self._action = action
+                self._observations = observations
+                self._called = True
+
+        # A dummy start message callback
+        def on_start(timeout, matchid, role, gdl, playclock):
+            pass
+
+        tmp = TMP()
+        handler = make_handler(on_start=on_start, on_stop=tmp.on_stop)
+
+        # Test after a START message
+        environ = make_environ("(START testmatch1 robot ((role robot) (other gdl)) 10 5)")
+        body = handler(environ, self.start_response_status_ok)
+
+        # Not sure if a STOP message with NIL actions is allowed. For the moment say no.
+        environ = make_environ("(STOP testmatch1 NIL)")
+        body = handler(environ, self.start_response_status_not_ok)
+
+        # Test the NIL message
+        tmp._called = False
+        environ = make_environ("(STOP testmatch1 ((a move )))")
+        body = handler(environ, self.start_response_status_ok)
+        self.assertTrue(tmp._called)
 
     #------------------------------------------
     # Test GGP INFO message
@@ -229,12 +349,12 @@ class GGPHandlerTest(unittest.TestCase):
     def test_default_info_message(self):
         handler = make_handler()
 
-        # Test upper case 
+        # Test upper case
         environ = make_environ("(INFO)")
         body = handler(environ, self.start_response_status_ok)
         self.assertEqual(body, "AVAILABLE")
 
-        # Test lower case 
+        # Test lower case
         environ = make_environ("(info)")
         body = handler(environ, self.start_response_status_ok)
         self.assertEqual(body, "available")
@@ -244,7 +364,7 @@ class GGPHandlerTest(unittest.TestCase):
     #------------------------------------------
     def test_preview_message(self):
         environ = make_environ("(PREVIEW ((role robot) (other gdl)) 10)")
-    
+
         # First test the default behaviour
         handler = make_handler()
         body = handler(environ, self.start_response_status_ok)
@@ -254,23 +374,22 @@ class GGPHandlerTest(unittest.TestCase):
         def on_preview(timeout, gdl):
             self.assertFalse(timeout.has_expired())
             self.assertEqual(gdl, "(role robot) (other gdl)")
-        
+
         environ = make_environ("(PREVIEW ((role robot) (other gdl)) 10)")
         handler = make_handler(on_preview=on_preview)
         body = handler(environ, self.start_response_status_ok)
         self.assertEqual(body, "DONE")
 
-        
 #-----------------------------
 # main
 #-----------------------------
-        
+
 def main():
     g_logger.setLevel(logging.DEBUG)
     g_logger.addHandler(logging.StreamHandler())
-    
+
     unittest.main()
-    
+
 if __name__ == '__main__':
     main()
 

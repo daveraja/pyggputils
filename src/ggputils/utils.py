@@ -174,6 +174,7 @@ def actions_to_sexp(actions):
         return "({0})".format(" ".join(actions))
     raise ValueError("{0} is not a sequence of actions".format(actions))
 
+
 #-----------------------------------------------------------------------
 # Split action values sexpression into a list of action value pairs.
 # eg., "((NOOP 50) ((MARK 3 4) 60))" => [("NOOP", 50), ("(MARK 3 4)", 60)]

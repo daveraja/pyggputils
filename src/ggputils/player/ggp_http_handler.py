@@ -1,16 +1,31 @@
-#---------------------------------------------------------------------------------
+#-------------------------------------------------------------------------
 #
 # Implementation of an HTTP Handler for a WSGI-based GGP player.  The
 # class adheres to the WSGI specification so is a functor that can be
 # called with the parameters: environ, start_response.
+#
+# This handler can deal with both the original GGP protocol and the
+# GGP-II protocol for imperfect information games. However (and
+# unfortunately) there is no unambiguous way to tell the difference
+# between the two protocols. Currently, the only way is to tell the
+# difference is to look at the GDL and if it has the "random" role and
+# sees predicate then assume it is GDL-II. However, even this is not
+# perfect since (I would think) it would still be possible to use a
+# GDL-II game description but run a GDL-I game.
+#
+# The current hack is to have a flag that determines which the GGP
+# protocol version. This flag (defaults to GDL-I) must be set at
+# creation of the Handler object.
 #
 # On instantiation the Handler requires a number of callback
 # functions. The functions correspond directly to the the GGP
 # communications protocol. The prototypes for the callbacks are:
 #
 # - on_start(timeout, matchid, role, gdl, playclock)
-# - on_play(timeout, actions)
-# - on_stop(timeout, actions)
+# - on_play(timeout, actions)    - GDL-I
+# - on_stop(timeout, actions)    - GDL-I
+# - on_play2(timeout, sees)      - GDL-II
+# - on_stop2(timeout, sees)      - GDL-II
 # - on_abort()
 # - on_info()
 # - on_preview(timeout, gdl)
@@ -35,9 +50,10 @@
 #   timeout should be reduced by a healthy margin to make sure that
 #   the player responds in time.
 #
-# - The actions in the on_play and on_stop callbacks are a dict of
-#   roles to actions. It can be empty, corresponding to the "NIL"
-#   actions string that happens with the first PLAY message of a game.
+# - The actions in the on_play and on_stop callbacks are a python
+#   dictionary of roles to actions. It can be empty, corresponding to
+#   the "NIL" actions string that happens with the first PLAY message
+#   of a game.
 #
 # The handler tries to be robust in how it handles requests. It adapts
 # to the variations between the Stanford game server and the Dresden
@@ -50,7 +66,7 @@
 #
 #
 # (c) 2014 David Rajaratnam
-#---------------------------------------------------------------------------------
+#-------------------------------------------------------------------------
 
 import time
 import re
@@ -64,12 +80,16 @@ from gevent.event import *
 
 g_logger = logging.getLogger(__name__)
 
-#---------------------------------------------------------------------------------
+#-------------------------------------------------------------------------
 # Handler does the hard work
-#---------------------------------------------------------------------------------
-
+#-------------------------------------------------------------------------
 
 class Handler(object):
+    #-------------------------------------
+    # The GGP gdl protocol versions
+    #-------------------------------------
+    GGP1 = 1         # GDL I protocol
+    GGP2 = 2         # GDL-II protocol
 
     #-------------------------------------
     # compiled regex for the GGP messages
@@ -110,17 +130,36 @@ class Handler(object):
     # - PREVIEW: does nothing except responds with "DONE"
     # - INFO: if not in a game then responds with "AVAILABLE", or "BUSY" otherwise.
     #---------------------------------------------------------------------------------
-    def __init__(self, on_start, on_play, on_stop, on_abort,
-                 on_info=None, on_preview=None, test_mode=False):
+    def __init__(self, on_start=None,
+                 on_play=None, on_stop=None,
+                 on_play2=None, on_stop2=None,
+                 on_abort=None,
+                 on_info=None, on_preview=None,
+                 protocol_version=None, test_mode=False):
+
+        if not protocol_version: protocol_version=Handler.GGP1
+        assert protocol_version in [Handler.GGP1, Handler.GGP2],\
+            "Unrecognised GDL protocol version {0}".format(protocol_version)
 
         # Test mode is useful for unit testing individual callback functions
         if not test_mode:
-            if not (on_start and on_play and on_stop and on_abort):
+            if (protocol_version == Handler.GGP1) and \
+               not (on_start and on_play and on_stop and on_abort):
                 raise ValueError(("Must have valid callbacks for: on_start, "
                                   "on_play, on_stop, on_abort"))
+            elif (protocol_version == Handler.GGP2) and \
+               not (on_start and on_play2 and on_stop2 and on_abort):
+                raise ValueError(("Must have valid callbacks for: on_start, "
+                                  "on_play2, on_stop2, on_abort"))
+
+        g_logger.info("Running player for GDL version: {0}".format(protocol_version))
+
+        self._protocol_version = protocol_version
         self._on_START = on_start
         self._on_PLAY = on_play
         self._on_STOP = on_stop
+        self._on_PLAY2 = on_play2
+        self._on_STOP2 = on_stop2
         self._on_ABORT = on_abort
         self._on_INFO = on_info
         self._on_PREVIEW = on_preview
@@ -131,6 +170,7 @@ class Handler(object):
         self._uppercase = True
 
         # Game player state related variables
+        self._gdl2_turn = 0
         self._matchid = None
         self._playclock = None
         self._startclock = None
@@ -256,13 +296,10 @@ class Handler(object):
         # Preview messages are always ok
         if Handler.re_s_PREVIEW.match(message): return True
 
-        # A START message when we're already in a game is bad
-#        if Handler.re_s_START.match(message):
-
         # A START message when we are in a game could mean a number of things:
-        # 1) either a message has been lost (somehow) or
-        # 2) The game master is not operating correctly (eg. crashed and restarted)
-        # 3) The player (i.e., the callback functions) has not been responded
+        # 1) either a message has been lost (somehow),
+        # 2) The game master is not operating correctly (eg. crashed and restarted),
+        # 3) The player (i.e., the callback functions) have not been responded
         #    within the timeout and there may be an end/abort message that is in
         #    the queue waiting to be handled.
         # Whatever the case the best we can do is log an error and let the
@@ -321,6 +358,9 @@ class Handler(object):
         else:
             raise HTTPErrorResponse(400, "Invalid GGP message: {0}".format(message))
 
+    #----------------------------------------------------------------------
+    # handle GGP START message
+    #----------------------------------------------------------------------
     def handle_START(self, timestamp, message):
         self._set_case(message, "START")
         match = Handler.re_m_START.match(message)
@@ -332,6 +372,8 @@ class Handler(object):
         self._startclock = int(match.group(4))
         self._playclock = int(match.group(5))
 
+        if self._protocol_version == Handler.GGP2: self._gdl2_turn = 0
+
         # Hack: need to process the GDL to extract the order of roles as they appear
         # in the GDL file so that we can get around the brokeness of the PLAY/STOP
         # messages, which require a player to know the order of roles to match
@@ -342,7 +384,7 @@ class Handler(object):
             g_logger.error(_fmt("GDL error. Will ignore this game: {0}", e))
             self._matchid = None
             return
-        
+
         timeout = Timeout(timestamp, self._startclock)
         self._on_START(timeout.clone(), self._matchid, role, gdl, self._playclock)
         remaining = timeout.remaining()
@@ -354,7 +396,9 @@ class Handler(object):
         # Now return the READY response
         return self._response("READY")
 
-
+    #----------------------------------------------------------------------
+    # handle GGP PLAY message
+    #----------------------------------------------------------------------
     def handle_PLAY(self, timestamp, message):
         match = Handler.re_m_PLAY.match(message)
         if not match:
@@ -363,17 +407,37 @@ class Handler(object):
         if self._matchid != matchid:
             self._on_ABORT()
             self._matchid = None
-            raise HTTPErrorResponse(400, "PLAY message has wrong matchid: {0} {1}".format(matchid, self._matchid))
+            raise HTTPErrorResponse(400, ("PLAY message has wrong matchid: "
+                                          "{0} {1}").format(matchid, self._matchid))
 
-        actionstr = match.group(2)
-        if not re.match(r'^\s*\(.*\)\s*$', actionstr) and not re.match(r'^\s*NIL\s*$', actionstr, re.I):
-            raise HTTPErrorResponse(400, "Malformed PLAY message {0}".format(message))
-        actions = parse_actions_sexp(actionstr)
-        if len(actions) != 0 and len(actions) != len(self._roles):
-            raise HTTPErrorResponse(400, "Malformed PLAY message {0}".format(message))
+        tmpstr = match.group(2)
+        action=None
+        actionstr=""
 
-        timeout = Timeout(timestamp, self._playclock)
-        action = self._on_PLAY(timeout.clone(), dict(zip(self._roles, actions)))
+        # GGP 1 and GGP 2 are handled differently
+        if self._protocol_version == Handler.GGP1:
+            # GDL-I: a list of actions
+            if not re.match(r'^\s*\(.*\)\s*$', tmpstr) and \
+               not re.match(r'^\s*NIL\s*$', tmpstr, re.I):
+                raise HTTPErrorResponse(400, "Malformed PLAY message {0}".format(message))
+            actions = parse_actions_sexp(tmpstr)
+            if len(actions) != 0 and len(actions) != len(self._roles):
+                raise HTTPErrorResponse(400, "Malformed PLAY message {0}".format(message))
+
+            timeout = Timeout(timestamp, self._playclock)
+            action = self._on_PLAY(timeout.clone(), dict(zip(self._roles, actions)))
+        else:
+            # GDL-II: a list of observations
+            (turn, action, observations) = _parse_gdl2_playstop_component("PLAY", message, tmpstr)
+            timeout = Timeout(timestamp, self._playclock)
+            action = self._on_PLAY2(timeout.clone(), action, observations)
+
+            if turn != self._gdl2_turn:
+                raise HTTPErrorResponse(400, ("PLAY message has wrong turn number: "
+                                          "{0} {1}").format(turn, self._gdl2_turn))
+            self._gdl2_turn += 1
+
+        # Handle the return action
         actionstr = "{0}".format(action)
 
         # Make sure the action is a valid s-expression
@@ -381,8 +445,9 @@ class Handler(object):
             exp = parse_simple_sexp(actionstr.strip())
         except:
             actionstr = "({0})".format(actionstr)
-            g_logger.critical(_fmt("Invalid action '{0}'. Will try to recover to and send {1}", action, actionstr))
-            
+            g_logger.critical(_fmt(("Invalid action '{0}'. Will try to recover to "
+                                    "and send {1}"), action, actionstr))
+
         remaining = timeout.remaining()
         if remaining <= 0:
             g_logger.error(_fmt("PLAY messsage handler late response by {0}s", remaining))
@@ -392,6 +457,9 @@ class Handler(object):
         # Returns the action as the response
         return actionstr
 
+    #----------------------------------------------------------------------
+    # handle GDL STOP message
+    #----------------------------------------------------------------------
     def handle_STOP(self, timestamp, message):
         match = Handler.re_m_STOP.match(message)
         if not match:
@@ -402,16 +470,30 @@ class Handler(object):
         if self._matchid != matchid:
             self._on_ABORT()
             self._matchid = None
-            raise HTTPErrorResponse(400, "PLAY message has wrong matchid: {0} {1}".format(matchid, self._matchid))
+            raise HTTPErrorResponse(400, ("PLAY message has wrong matchid: "
+                                          "{0} {1}").format(matchid, self._matchid))
 
         # Extract the actions and match to the correct roles
-        actionstr = match.group(2)
-        actions = parse_actions_sexp(actionstr)
-        if len(actions) != len(self._roles):
-            raise HTTPErrorResponse(400, "Malformed STOP message {0}".format(message))
+        tmpstr = match.group(2)
 
-        timeout = Timeout(timestamp, self._playclock)
-        self._on_STOP(timeout.clone(), dict(zip(self._roles, actions)))
+        # GGP 1 and GGP 2 are handled differently
+        if self._protocol_version == Handler.GGP1:
+            # GDL-I: a list of actions
+            actions = parse_actions_sexp(tmpstr)
+            if len(actions) != len(self._roles):
+                raise HTTPErrorResponse(400, "Malformed STOP message {0}".format(message))
+            timeout = Timeout(timestamp, self._playclock)
+            self._on_STOP(timeout.clone(), dict(zip(self._roles, actions)))
+        else:
+            # GDL-II: a list of observations
+            (turn, action, observations) = _parse_gdl2_playstop_component("STOP", message, tmpstr)
+            if turn != self._gdl2_turn:
+                raise HTTPErrorResponse(400, ("STOP message has wrong turn number: "
+                                          "{0} {1}").format(turn, self._gdl2_turn))
+            self._gdl2_turn += 1
+
+            timeout = Timeout(timestamp, self._playclock)
+            self._on_STOP2(timeout.clone(), action, observations)
 
         remaining = timeout.remaining()
         if remaining <= 0:
@@ -422,6 +504,9 @@ class Handler(object):
         # Now return the DONE response
         return self._response("DONE")
 
+    #----------------------------------------------------------------------
+    # handle GGP INFO message
+    #----------------------------------------------------------------------
     def handle_INFO(self, timestamp, message):
         self._set_case(message, "INFO")
         match = Handler.re_m_INFO.match(message)
@@ -439,6 +524,9 @@ class Handler(object):
             raise ValueError("on_info() callback returned an empty value")
         return self._response(self._on_INFO())
 
+    #----------------------------------------------------------------------
+    # handle GGP ABORT message
+    #----------------------------------------------------------------------
     def handle_ABORT(self, timestamp, message):
         self._set_case(message, "ABORT")
         match = Handler.re_m_ABORT.match(message)
@@ -448,7 +536,8 @@ class Handler(object):
         if self._matchid != matchid:
             self._on_ABORT()
             self._matchid = None
-            raise HTTPErrorResponse(400, "ABORT message has wrong matchid: {0} {1}".format(matchid, self._matchid))
+            raise HTTPErrorResponse(400, ("ABORT message has wrong matchid: "
+                                          "{0} {1}").format(matchid, self._matchid))
 
         self._matchid = None
         self._on_ABORT()
@@ -458,6 +547,9 @@ class Handler(object):
         # Test website expects "ABORTED" while description states "DONE"
         return self._response("ABORTED")
 
+    #----------------------------------------------------------------------
+    # handle GGP PREVIEW message
+    #----------------------------------------------------------------------
     def handle_PREVIEW(self, timestamp, message):
         self._set_case(message, "PREVIEW")
         match = Handler.re_m_PREVIEW.match(message)
@@ -562,6 +654,37 @@ def _get_http_post(environ):
         g_logger.warning(_fmt("HTTP POST exception: {0}", e))
         raise HTTPErrorResponse(400, 'Invalid content')
 
+
+#---------------------------------------------------------------------------------
+# parse part of a GDL-II play/stop message consisting of:
+#    "<turn> <lastmove> <observations>"
+# Returns a triple of these elements.
+# ---------------------------------------------------------------------------------
+
+def _parse_gdl2_playstop_component(mtype, message, component):
+    error="Malformed GDL-II {0} message {1}".format(mtype, message)
+
+    # Handle the turn part first
+    match = re.match(r'^\s*(\d+)\s+(.*)\s*$', component)
+    if not match: raise HTTPErrorResponse(400, error)
+    turn=int(match.group(1))
+    tmpstr=match.group(2)
+
+    # Parse the remaining <lastmove> <observations> as an sexpression
+    exp=parse_simple_sexp("({0})".format(tmpstr))
+    if type(exp) == type(''): raise HTTPErrorResponse(400, error)
+    if len(exp) != 2: raise HTTPErrorResponse(400, error)
+    lastaction = exp_to_sexp(exp[0])
+    if lastaction == "NIL": lastaction=None
+    if turn == 0 and lastaction: raise HTTPErrorResponse(400, error)
+    if type(exp[1]) == type(''):
+        if exp[1] != "NIL": raise HTTPErrorResponse(400, error)
+        return (turn, lastaction, [])
+
+    observations = []
+    for oexp in exp[1]:
+        observations.append(exp_to_sexp(oexp))
+    return (turn, lastaction, observations)
 
 #---------------------------------------------------------------------------------
 # Unescape html the "&lt;" "&gt;" "&amp;"

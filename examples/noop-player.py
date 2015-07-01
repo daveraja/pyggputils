@@ -36,12 +36,21 @@ def on_start(timeout, matchid, role, gdl, playclock):
 def on_update(actions):
     g_logger.info("Updating actions: {0}".format(actions))
 
+
+#---------------------------------------------------------------------------------
+# Callback function to update the state of the system with a set of observations
+#---------------------------------------------------------------------------------
+def on_update2(action, observations):
+    g_logger.info(("Updating with action {0} and observations "
+                   "{1}").format(action, observations))
+
 #---------------------------------------------------------------------------------
 # Callback function to select a move within the timeout
 #---------------------------------------------------------------------------------
 def on_select(timeout):
     timeout.reduce(1.5)
-    g_logger.info("Select: player has {0} seconds to make a move".format(timeout.remaining()))
+    g_logger.info(("Select: player has {0} seconds to make "
+                   "a move").format(timeout.remaining()))
     time.sleep(timeout.remaining())
     return "NOOP"
 
@@ -50,7 +59,7 @@ def on_select(timeout):
 #---------------------------------------------------------------------------------
 def on_clear():
     g_logger.info("Clearing game state")
-    
+
 #---------------------------------------------------------------------------------
 # log_level(log_string)
 #---------------------------------------------------------------------------------
@@ -62,28 +71,36 @@ def log_level(log_string):
     elif re.match(r'^debug$', log_string): return logging.DEBUG
     else:
         raise ValueError("Invalid log level: {0}".format(log_string))
-    
+
 #-----------------------------
 # main
 #-----------------------------
-        
+
 def main():
     parser = argparse.ArgumentParser(description="NOOP GGP Player")
-    parser.add_argument("--host", default="", 
+    parser.add_argument("--host", default="",
                         help="listener host")
-    parser.add_argument("--port", type=int, default=4001, 
+    parser.add_argument("--port", type=int, default=4001,
                         help="ggp player port")
-    parser.add_argument("--log-level", default="debug", 
+    parser.add_argument("--log-level", default="debug",
                         choices=['critical','error','warning','info','debug'],
                         help="logging level")
+    parser.add_argument("--gdl-version", type=int, default=1,
+                        help="The GDL version (1 or 2)")
     args = parser.parse_args()
-    
+
     # Some some logging
     g_logger.setLevel(log_level(args.log_level))
     g_logger.addHandler(logging.StreamHandler())
 
-    SimplePlayer((args.host, args.port), on_start=on_start, on_update=on_update,
-                 on_select=on_select, on_clear=on_clear)
-    
+    if args.gdl_version == 1:
+        SimplePlayer((args.host, args.port),
+                     on_start=on_start, on_update=on_update,
+                     on_select=on_select, on_clear=on_clear)
+    else:
+        SimplePlayer((args.host, args.port),
+                     on_start=on_start, on_update2=on_update2,
+                     on_select=on_select, on_clear=on_clear)
+
 if __name__ == '__main__':
     main()
